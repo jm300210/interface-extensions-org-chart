@@ -1,8 +1,42 @@
 import './style.css';
-import React, { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
-import { initializeBlock, useBase, useRecords, expandRecord, useCustomProperties, useRunInfo, CellRenderer } from '@airtable/blocks/interface/ui';
-import { FieldType, Base, Table, Field, Record as AirtableRecord, type FieldConfig } from '@airtable/blocks/interface/models';
-import { UserIcon, PlusIcon, MinusIcon } from '@phosphor-icons/react';
+
+import React, {
+  useState,
+  useMemo,
+  useCallback,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+} from 'react';
+
+import {
+  initializeBlock,
+  useBase,
+  useRecords,
+  expandRecord,
+  useCustomProperties,
+  useRunInfo,
+  CellRenderer,
+} from '@airtable/blocks/interface/ui';
+
+import {
+  FieldType,
+  Base,
+  Table,
+  Field,
+  Record as AirtableRecord,
+  type FieldConfig,
+} from '@airtable/blocks/interface/models';
+
+import {
+  UserIcon,
+  PlusIcon,
+  MinusIcon,
+} from '@phosphor-icons/react';
+
+// ============================================================
+// INTERFACES
+// ============================================================
 
 interface OrgNode {
   id: string;
@@ -26,133 +60,228 @@ interface LayoutNode {
   node: OrgNode;
 }
 
-const NODE_WIDTH = 272;
-const MIN_GAP = 16;
-const LEVEL_GAP = 60; // Vertical gap between levels
-
-// Card height estimation constants (generous for spacing)
-const CARD_BASE_HEIGHT = 78; // Header (photo + name) + card padding
-const FIELD_HEIGHT = 44; // Height per additional field (label + value + spacing)
-const BUTTON_HEIGHT = 44; // Height for collapse/expand button with margin
-const HEIGHT_BUFFER = 24; // Extra buffer for spacing between levels
-
-// Interaction constants
-const INITIAL_TOP_PADDING = 60; // Padding from top when centering on root node
-const DRAG_THRESHOLD = 5; // Minimum pixels moved to consider it a drag vs click
-const INITIAL_X_OFFSET = 50; // Initial X offset for positioning root trees
-
 interface LayoutResult {
   positions: Map<string, NodePosition>;
   nodeHeights: Map<string, number>;
-  levelHeights: number[]; // Max height at each depth level
-  levelYPositions: number[]; // Cumulative Y positions for each level
+  levelHeights: number[];
+  levelYPositions: number[];
 }
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const NODE_WIDTH = 272;
+const MIN_GAP = 16;
+const LEVEL_GAP = 40;
+
+const CARD_BASE_HEIGHT = 150;
+const FIELD_HEIGHT = 56;
+const BUTTON_HEIGHT = 48;
+const HEIGHT_BUFFER = 36;
+
+const INITIAL_TOP_PADDING = 60;
+const DRAG_THRESHOLD = 5;
+const INITIAL_X_OFFSET = 50;
+
+// ============================================================
+// TREE LAYOUT ALGORITHM
+// IMPORTANT: This function is pure and contains NO React hooks.
+// ============================================================
 
 function calculateTreeLayout(
   nodes: OrgNode[],
-  getFieldCount: (node: OrgNode) => number
+  getFieldCount: (node: OrgNode) => number,
+  measuredCardHeights: Map<string, number>
 ): LayoutResult {
-  // First, calculate height for each node
+
   const nodeHeights = new Map<string, number>();
   const levelMaxHeights = new Map<number, number>();
-  
+
+  // Calculate node heights recursively.
   function calculateHeights(node: OrgNode, depth: number) {
     const fieldCount = getFieldCount(node);
     const hasChildren = node.children.length > 0;
-    const height = CARD_BASE_HEIGHT + (fieldCount * FIELD_HEIGHT) + (hasChildren ? BUTTON_HEIGHT : 0) + HEIGHT_BUFFER;
+
+    const estimatedHeight =
+      CARD_BASE_HEIGHT +
+      fieldCount * FIELD_HEIGHT +
+      (hasChildren ? BUTTON_HEIGHT : 0);
+
+    const actualHeight =
+      measuredCardHeights.get(node.id) ?? estimatedHeight;
+
+    const height = actualHeight + HEIGHT_BUFFER;
+
     nodeHeights.set(node.id, height);
-    
-    // Track max height at this depth
+
     const currentMax = levelMaxHeights.get(depth) || 0;
-    levelMaxHeights.set(depth, Math.max(currentMax, height));
-    
+
+    levelMaxHeights.set(
+      depth,
+      Math.max(currentMax, height)
+    );
+
     if (!node.collapsed) {
-      node.children.forEach(child => calculateHeights(child, depth + 1));
-    }
-  }
-  
-  nodes.forEach(root => calculateHeights(root, 0));
-  
-  // Convert level max heights to array and calculate cumulative Y positions
-  const maxDepth = Math.max(...Array.from(levelMaxHeights.keys()), 0);
-  const levelHeights: number[] = [];
-  const levelYPositions: number[] = [0];
-  
-  for (let d = 0; d <= maxDepth; d++) {
-    const height = levelMaxHeights.get(d) || CARD_BASE_HEIGHT;
-    levelHeights.push(height);
-    if (d < maxDepth) {
-      levelYPositions.push(levelYPositions[d] + height + LEVEL_GAP);
+      node.children.forEach(child => {
+        calculateHeights(child, depth + 1);
+      });
     }
   }
 
-  function buildLayout(node: OrgNode): LayoutNode {
-    if (node.collapsed || node.children.length === 0) {
-      return { x: 0, children: [], node };
+  nodes.forEach(root => calculateHeights(root, 0));
+
+  // Calculate vertical positions for each level.
+  const maxDepth = Math.max(
+    ...Array.from(levelMaxHeights.keys()),
+    0
+  );
+
+  const levelHeights: number[] = [];
+  const levelYPositions: number[] = [0];
+
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    const height =
+      levelMaxHeights.get(depth) || CARD_BASE_HEIGHT;
+
+    levelHeights.push(height);
+
+    if (depth < maxDepth) {
+      levelYPositions.push(
+        levelYPositions[depth] + height + LEVEL_GAP
+      );
     }
-    
-    const childLayouts = node.children.map(child => buildLayout(child));
-    
-    // Position children next to each other, accounting for contours
-    for (let i = 1; i < childLayouts.length; i++) {
-      const leftContour = getRightContour(childLayouts[i - 1], 0, [], 0);
-      const rightContour = getLeftContour(childLayouts[i], 0, [], 0);
-      
-      let maxShift = 0;
-      const maxDepth = Math.min(leftContour.length, rightContour.length);
-      
-      for (let d = 0; d < maxDepth; d++) {
-        const neededShift = leftContour[d] - rightContour[d] + MIN_GAP;
-        maxShift = Math.max(maxShift, neededShift);
-      }
-      
-      // Also ensure top-level children don't overlap
-      const prevChildRight = childLayouts[i - 1].x + NODE_WIDTH / 2;
-      const thisChildLeft = childLayouts[i].x - NODE_WIDTH / 2;
-      const directShift = prevChildRight - thisChildLeft + MIN_GAP;
-      maxShift = Math.max(maxShift, directShift);
-      
-      // Only shift the root of the subtree - children are relative to it
-      childLayouts[i].x += maxShift;
-    }
-    
-    // Center parent over children
-    const leftmostChild = childLayouts[0].x;
-    const rightmostChild = childLayouts[childLayouts.length - 1].x;
-    const centerX = (leftmostChild + rightmostChild) / 2;
-    
-    // Shift all children so parent is at x=0
-    childLayouts.forEach(cl => { cl.x -= centerX; });
-    
-    return { x: 0, children: childLayouts, node };
   }
-  
-  // Get left contour accounting for cumulative parent offset
-  function getLeftContour(layout: LayoutNode, depth = 0, contour: number[] = [], parentOffset = 0): number[] {
+
+  // Calculate left contour.
+  function getLeftContour(
+    layout: LayoutNode,
+    depth = 0,
+    contour: number[] = [],
+    parentOffset = 0
+  ): number[] {
     const absoluteX = parentOffset + layout.x;
     const left = absoluteX - NODE_WIDTH / 2;
+
     if (contour.length <= depth) {
       contour.push(left);
     } else {
-      contour[depth] = Math.min(contour[depth], left);
+      contour[depth] = Math.min(
+        contour[depth],
+        left
+      );
     }
-    layout.children.forEach(cl => getLeftContour(cl, depth + 1, contour, absoluteX));
+
+    layout.children.forEach(child => {
+      getLeftContour(
+        child,
+        depth + 1,
+        contour,
+        absoluteX
+      );
+    });
+
     return contour;
   }
-  
-  // Get right contour accounting for cumulative parent offset
-  function getRightContour(layout: LayoutNode, depth = 0, contour: number[] = [], parentOffset = 0): number[] {
+
+  // Calculate right contour.
+  function getRightContour(
+    layout: LayoutNode,
+    depth = 0,
+    contour: number[] = [],
+    parentOffset = 0
+  ): number[] {
     const absoluteX = parentOffset + layout.x;
     const right = absoluteX + NODE_WIDTH / 2;
+
     if (contour.length <= depth) {
       contour.push(right);
     } else {
-      contour[depth] = Math.max(contour[depth], right);
+      contour[depth] = Math.max(
+        contour[depth],
+        right
+      );
     }
-    layout.children.forEach(cl => getRightContour(cl, depth + 1, contour, absoluteX));
+
+    layout.children.forEach(child => {
+      getRightContour(
+        child,
+        depth + 1,
+        contour,
+        absoluteX
+      );
+    });
+
     return contour;
   }
-  
+
+  // Build the tree layout.
+  function buildLayout(node: OrgNode): LayoutNode {
+    if (node.collapsed || node.children.length === 0) {
+      return {
+        x: 0,
+        children: [],
+        node,
+      };
+    }
+
+    const childLayouts = node.children.map(child =>
+      buildLayout(child)
+    );
+
+    const occupiedRight: number[] = [];
+
+    for (let i = 0; i < childLayouts.length; i++) {
+      const child = childLayouts[i];
+
+      const childLeft = getLeftContour(child);
+      const childRight = getRightContour(child);
+
+      let shift = 0;
+
+      for (let depth = 0; depth < childLeft.length; depth++) {
+        if (occupiedRight[depth] !== undefined) {
+          const neededShift =
+            occupiedRight[depth] -
+            childLeft[depth] +
+            MIN_GAP;
+
+          shift = Math.max(shift, neededShift);
+        }
+      }
+
+      child.x += shift;
+
+      for (let depth = 0; depth < childRight.length; depth++) {
+        const shiftedRight = childRight[depth] + shift;
+
+        occupiedRight[depth] = Math.max(
+          occupiedRight[depth] ?? -Infinity,
+          shiftedRight
+        );
+      }
+    }
+
+    const leftmostChild = childLayouts[0].x;
+
+    const rightmostChild =
+      childLayouts[childLayouts.length - 1].x;
+
+    const centerX =
+      (leftmostChild + rightmostChild) / 2;
+
+    childLayouts.forEach(child => {
+      child.x -= centerX;
+    });
+
+    return {
+      x: 0,
+      children: childLayouts,
+      node,
+    };
+  }
+
+  // Convert relative positions to absolute positions.
   function toAbsolute(
     layout: LayoutNode,
     parentX: number,
@@ -161,43 +290,78 @@ function calculateTreeLayout(
   ) {
     const absoluteX = parentX + layout.x;
     const y = levelYPositions[depth] || 0;
-    positions.set(layout.node.id, { x: absoluteX, y, depth });
-    layout.children.forEach(cl => toAbsolute(cl, absoluteX, depth + 1, positions));
+
+    positions.set(layout.node.id, {
+      x: absoluteX,
+      y,
+      depth,
+    });
+
+    layout.children.forEach(child => {
+      toAbsolute(
+        child,
+        absoluteX,
+        depth + 1,
+        positions
+      );
+    });
   }
-  
+
   const positions = new Map<string, NodePosition>();
+
   let currentX = INITIAL_X_OFFSET;
-  
+
   for (const root of nodes) {
     const layout = buildLayout(root);
-    const leftContour = getLeftContour(layout, 0, [], 0);
-    const rightContour = getRightContour(layout, 0, [], 0);
-    
+
+    const leftContour = getLeftContour(layout);
+    const rightContour = getRightContour(layout);
+
     const leftmost = Math.min(...leftContour);
     const shift = currentX - leftmost;
+
     layout.x += shift;
-    
+
     toAbsolute(layout, 0, 0, positions);
-    
-    const rightmostAfterShift = Math.max(...rightContour) + shift;
-    currentX = rightmostAfterShift + MIN_GAP * 2;
+
+    const rightmostAfterShift =
+      Math.max(...rightContour) + shift;
+
+    currentX =
+      rightmostAfterShift + MIN_GAP * 2;
   }
-  
-  return { positions, nodeHeights, levelHeights, levelYPositions };
+
+  return {
+    positions,
+    nodeHeights,
+    levelHeights,
+    levelYPositions,
+  };
 }
 
-// Recursively collect all visible nodes for rendering (pure function, no component dependencies)
+// ============================================================
+// COLLECT VISIBLE NODES
+// ============================================================
+
 function collectAllNodes(nodes: OrgNode[]): OrgNode[] {
   const result: OrgNode[] = [];
+
   function collect(node: OrgNode) {
     result.push(node);
+
     if (!node.collapsed) {
       node.children.forEach(collect);
     }
   }
+
   nodes.forEach(collect);
+
   return result;
 }
+
+// ============================================================
+// AIRTABLE CUSTOM PROPERTIES
+// ============================================================
 
 function getCustomProperties(base: Base) {
   const defaultTable = base.tables[0];
@@ -214,23 +378,36 @@ function getCustomProperties(base: Base) {
       label: 'Name Field',
       type: 'field' as const,
       table: defaultTable,
-      defaultValue: defaultTable?.getFieldIfExists('Name') ?? undefined,
+      defaultValue:
+        defaultTable?.getFieldIfExists('Name') ?? undefined,
     },
     {
       key: 'profilePictureField',
       label: 'Profile Picture Field',
       type: 'field' as const,
       table: defaultTable,
-      shouldFieldBeAllowed: (field: {id: string; config: FieldConfig}) => field.config.type === FieldType.MULTIPLE_ATTACHMENTS,
-      defaultValue: defaultTable?.getFieldIfExists('Profile Picture') ?? undefined,
+      shouldFieldBeAllowed: (
+        field: { id: string; config: FieldConfig }
+      ) =>
+        field.config.type ===
+        FieldType.MULTIPLE_ATTACHMENTS,
+      defaultValue:
+        defaultTable?.getFieldIfExists('Profile Picture') ??
+        undefined,
     },
     {
       key: 'managerField',
       label: 'Manager Field',
       type: 'field' as const,
       table: defaultTable,
-      shouldFieldBeAllowed: (field: {id: string; config: FieldConfig}) => field.config.type === FieldType.MULTIPLE_RECORD_LINKS,
-      defaultValue: defaultTable?.getFieldIfExists('Manager') ?? undefined,
+      shouldFieldBeAllowed: (
+        field: { id: string; config: FieldConfig }
+      ) =>
+        field.config.type ===
+        FieldType.MULTIPLE_RECORD_LINKS,
+      defaultValue:
+        defaultTable?.getFieldIfExists('Manager') ??
+        undefined,
     },
     {
       key: 'cardProperty1',
@@ -253,8 +430,25 @@ function getCustomProperties(base: Base) {
       table: defaultTable,
       defaultValue: undefined,
     },
+    {
+      key: 'cardProperty4',
+      label: 'Card Property (4)',
+      type: 'field' as const,
+      table: defaultTable,
+      defaultValue: undefined,
+    },
+    {
+      key: 'cardProperty5',
+      label: 'Card Property (5)',
+      type: 'field' as const,
+      table: defaultTable,
+      defaultValue: undefined,
+    },
   ];
 }
+// ============================================================
+// NODE CARD COMPONENT
+// ============================================================
 
 function NodeCard({
   node,
@@ -265,6 +459,7 @@ function NodeCard({
   onCardClick,
   onCardKeyDown,
   onToggleCollapse,
+  onCardHeightChange,
 }: {
   node: OrgNode;
   position: NodePosition;
@@ -274,30 +469,69 @@ function NodeCard({
   onCardClick: (e: React.MouseEvent<HTMLDivElement>) => void;
   onCardKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void;
   onToggleCollapse: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  onCardHeightChange: (nodeId: string, height: number) => void;
 }): React.ReactElement {
+
   const hasChildren = node.children.length > 0;
+
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  // Measure the actual rendered card height.
+  // Hooks belong inside this React component, not the layout function.
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+
+    if (!card) return;
+
+    const reportHeight = () => {
+      const height = card.getBoundingClientRect().height;
+
+      onCardHeightChange(node.id, height);
+    };
+
+    reportHeight();
+
+    const observer = new ResizeObserver(reportHeight);
+
+    observer.observe(card);
+
+    return () => observer.disconnect();
+
+  }, [node.id, onCardHeightChange]);
 
   return (
     <div
       className="absolute"
       style={{
-        left: position.x + canvasBounds.offsetX - NODE_WIDTH / 2,
+        left:
+          position.x +
+          canvasBounds.offsetX -
+          NODE_WIDTH / 2,
         top: position.y + canvasBounds.offsetY,
         width: NODE_WIDTH,
       }}
     >
       <div
+        ref={cardRef}
         role={canExpandRecords ? 'button' : undefined}
         tabIndex={canExpandRecords ? 0 : undefined}
-        aria-label={canExpandRecords ? `View details for ${node.name}` : undefined}
+        aria-label={
+          canExpandRecords
+            ? `View details for ${node.name}`
+            : undefined
+        }
         data-node-id={node.id}
         className={`bg-white dark:bg-gray-700 rounded-lg shadow-md hover:shadow-lg transition-shadow p-4 border border-gray-200 dark:border-gray-600 ${
           canExpandRecords ? 'cursor-pointer' : ''
         }`}
         onClick={onCardClick}
-        onKeyDown={canExpandRecords ? onCardKeyDown : undefined}
+        onKeyDown={
+          canExpandRecords ? onCardKeyDown : undefined
+        }
       >
+        {/* Employee header */}
         <div className="flex items-start gap-3 mb-3">
+
           {node.profilePicture ? (
             <img
               src={node.profilePicture}
@@ -306,527 +540,1293 @@ function NodeCard({
               draggable={false}
             />
           ) : (
-            <div className="w-12 h-12 rounded-full bg-gray-200 dark:bg-gray-600 flex items-center justify-center flex-shrink-0" aria-hidden="true">
-              <UserIcon size={24} className="text-gray-500 dark:text-gray-400" />
+            <div
+              className="w-12 h-12 rounded-full bg-gray-200 dark:bg-gray-600 flex items-center justify-center flex-shrink-0"
+              aria-hidden="true"
+            >
+              <UserIcon
+                size={24}
+                className="text-gray-500 dark:text-gray-400"
+              />
             </div>
           )}
+
           <div className="flex-1 min-w-0">
             <h3 className="font-semibold text-base text-gray-900 dark:text-white truncate">
               {node.name}
             </h3>
           </div>
+
         </div>
 
+        {/* Configured Airtable fields */}
         {fieldsWithValues.length > 0 && (
           <div className="space-y-1.5 text-xs">
+
             {fieldsWithValues.map((field: Field) => {
-              const isSelectField = field.type === FieldType.SINGLE_SELECT || field.type === FieldType.MULTIPLE_SELECTS;
+
+              const isSelectField =
+                field.type === FieldType.SINGLE_SELECT ||
+                field.type === FieldType.MULTIPLE_SELECTS;
+
               return (
                 <div key={field.id}>
-                  <div className={`font-medium text-gray-500 dark:text-gray-500 ${isSelectField ? 'mb-1' : ''}`}>{field.name}</div>
-                  <div className="text-gray-700 dark:text-gray-300">
-                    <CellRenderer record={node.record} field={field} />
+
+                  <div
+                    className={`font-medium text-gray-500 dark:text-gray-400 ${
+                      isSelectField ? 'mb-1' : ''
+                    }`}
+                  >
+                    {field.name}
                   </div>
+
+                  <div className="text-gray-700 dark:text-gray-300">
+                    <CellRenderer
+                      record={node.record}
+                      field={field}
+                    />
+                  </div>
+
                 </div>
               );
             })}
+
           </div>
         )}
 
+        {/* Collapse / expand button */}
         {hasChildren && (
           <button
             aria-expanded={!node.collapsed}
-            aria-label={node.collapsed ? `Show ${node.children.length} direct report${node.children.length !== 1 ? 's' : ''} for ${node.name}` : `Hide direct reports for ${node.name}`}
+            aria-label={
+              node.collapsed
+                ? `Show ${node.children.length} direct reports for ${node.name}`
+                : `Hide direct reports for ${node.name}`
+            }
             data-node-id={node.id}
             className="mt-3 w-full bg-gray-100 hover:bg-gray-200 dark:bg-gray-600 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 px-3 py-1.5 rounded-md text-xs font-medium"
             onClick={onToggleCollapse}
           >
-            {node.collapsed ? `Show ${node.children.length} Report${node.children.length !== 1 ? 's' : ''}` : 'Hide Reports'}
+            {node.collapsed
+              ? `Show ${node.children.length} Report${
+                  node.children.length !== 1 ? 's' : ''
+                }`
+              : 'Hide Reports'}
           </button>
         )}
+
       </div>
     </div>
   );
 }
 
-function OrgChartApp(): React.ReactElement {
-  const base = useBase();
-  const { customPropertyValueByKey, errorState } = useCustomProperties(useCallback(getCustomProperties, []));
+// ============================================================
+// MAIN ORG CHART APPLICATION
+// ============================================================
 
-  const table = customPropertyValueByKey.employeesTable as Table | undefined;
+function OrgChartApp(): React.ReactElement {
+
+  const base = useBase();
+
+  const {
+    customPropertyValueByKey,
+    errorState,
+  } = useCustomProperties(
+    useCallback(getCustomProperties, [])
+  );
+
+  const table =
+    customPropertyValueByKey.employeesTable as
+      | Table
+      | undefined;
+
   const records = useRecords(table || base.tables[0]);
 
+  // ----------------------------------------------------------
+  // STATE
+  // ----------------------------------------------------------
+
   const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [collapsedNodes, setCollapsedNodes] = useState<Set<string>>(new Set());
+
+  const [pan, setPan] = useState({
+    x: 0,
+    y: 0,
+  });
+
+  const [measuredCardHeights, setMeasuredCardHeights] =
+    useState<Map<string, number>>(new Map());
+
+  const [collapsedNodes, setCollapsedNodes] =
+  useState<Set<string>>(new Set());
+
+  const hasInitializedCollapse = useRef(false);
+
   const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  const [dragStart, setDragStart] = useState({
+    x: 0,
+    y: 0,
+  });
+
+  // ----------------------------------------------------------
+  // REFS
+  // ----------------------------------------------------------
+
   const containerRef = useRef<HTMLDivElement>(null);
+
   const canvasRef = useRef<HTMLDivElement>(null);
+
   const hasInitializedView = useRef(false);
-  // Track anchor node to keep it stationary during collapse/expand
-  const anchorNode = useRef<{nodeId: string; screenX: number; screenY: number} | null>(null);
-  // Track if actual dragging movement occurred (to prevent click after drag)
+
+  const anchorNode = useRef<{
+    nodeId: string;
+    screenX: number;
+    screenY: number;
+  } | null>(null);
+
   const hasDraggedRef = useRef(false);
-  const mouseDownPosRef = useRef({ x: 0, y: 0 });
+
+  const mouseDownPosRef = useRef({
+    x: 0,
+    y: 0,
+  });
+
+  // ----------------------------------------------------------
+  // CARD HEIGHT CALLBACK
+  // ----------------------------------------------------------
+
+  const handleCardHeightChange = useCallback(
+    (nodeId: string, height: number) => {
+
+      setMeasuredCardHeights(previous => {
+
+        const existingHeight = previous.get(nodeId);
+
+        if (
+          existingHeight !== undefined &&
+          Math.abs(existingHeight - height) < 0.5
+        ) {
+          return previous;
+        }
+
+        const updated = new Map(previous);
+
+        updated.set(nodeId, height);
+
+        return updated;
+      });
+
+    },
+    []
+  );
+
+  // ----------------------------------------------------------
+  // AIRTABLE PERMISSIONS
+  // ----------------------------------------------------------
 
   const runInfo = useRunInfo();
-  const canExpandRecords = table?.hasPermissionToExpandRecords() || runInfo.isPageElementInEditMode;
 
-  // Required fields for the org chart to function
-  const nameField = customPropertyValueByKey.nameField as Field | undefined;
-  const profilePictureField = customPropertyValueByKey.profilePictureField as Field | undefined;
-  const managerField = customPropertyValueByKey.managerField as Field | undefined;
+  const canExpandRecords =
+    table?.hasPermissionToExpandRecords() ||
+    runInfo.isPageElementInEditMode;
 
-  // Optional card property fields
-  const cardProperty1 = customPropertyValueByKey.cardProperty1 as Field | undefined;
-  const cardProperty2 = customPropertyValueByKey.cardProperty2 as Field | undefined;
-  const cardProperty3 = customPropertyValueByKey.cardProperty3 as Field | undefined;
+  // ----------------------------------------------------------
+  // CONFIGURED AIRTABLE FIELDS
+  // ----------------------------------------------------------
 
-  const requiredFieldsConfigured = nameField && profilePictureField && managerField;
+  const nameField =
+    customPropertyValueByKey.nameField as
+      | Field
+      | undefined;
 
-  // Get configured card property fields (filtering out undefined values)
-  const configuredCardFields = useMemo(() => {
-    return [cardProperty1, cardProperty2, cardProperty3].filter((field): field is Field => field !== undefined);
-  }, [cardProperty1, cardProperty2, cardProperty3]);
+  const profilePictureField =
+    customPropertyValueByKey.profilePictureField as
+      | Field
+      | undefined;
 
-  const orgData = useMemo(() => {
-    if (!table || !records || !requiredFieldsConfigured) return [];
+  const managerField =
+    customPropertyValueByKey.managerField as
+      | Field
+      | undefined;
 
-    const nodes: Map<string, OrgNode> = new Map();
+  // Optional card properties.
+  const cardProperty1 =
+    customPropertyValueByKey.cardProperty1 as
+      | Field
+      | undefined;
 
-    records.forEach(record => {
-      const managerValue = managerField ? record.getCellValue(managerField) : null;
-      const managerId = managerValue && Array.isArray(managerValue) && managerValue.length > 0
+  const cardProperty2 =
+    customPropertyValueByKey.cardProperty2 as
+      | Field
+      | undefined;
+
+  const cardProperty3 =
+    customPropertyValueByKey.cardProperty3 as
+      | Field
+      | undefined;
+
+  const cardProperty4 =
+    customPropertyValueByKey.cardProperty4 as
+      | Field
+      | undefined;
+
+  const cardProperty5 =
+    customPropertyValueByKey.cardProperty5 as
+      | Field
+      | undefined;
+
+  const requiredFieldsConfigured = Boolean(
+    nameField &&
+    profilePictureField &&
+    managerField
+  );
+
+  // ----------------------------------------------------------
+// INITIAL COLLAPSE: FIRST THREE TIERS VISIBLE
+// ----------------------------------------------------------
+
+useEffect(() => {
+
+  if (hasInitializedCollapse.current) return;
+  if (!records || !managerField) return;
+
+  const employeeMap = new Map<string, string | null>();
+
+  records.forEach(record => {
+
+    const managerValue =
+      record.getCellValue(managerField);
+
+    const managerId =
+      managerValue &&
+      Array.isArray(managerValue) &&
+      managerValue.length > 0
         ? managerValue[0].id
         : null;
 
-      const profilePictureValue = profilePictureField ? record.getCellValue(profilePictureField) : null;
-      const profilePicture = profilePictureValue && Array.isArray(profilePictureValue) && profilePictureValue.length > 0
-        ? profilePictureValue[0].url
+    employeeMap.set(record.id, managerId);
+
+  });
+
+  const collapsed = new Set<string>();
+
+  records.forEach(record => {
+
+    let depth = 1;
+    let managerId = employeeMap.get(record.id);
+
+    while (managerId && employeeMap.has(managerId)) {
+
+      depth++;
+
+      managerId = employeeMap.get(managerId) ?? null;
+
+    }
+
+    // Collapse supervisors at tier 3 and below.
+    if (depth >= 3) {
+
+      const hasReports = records.some(r =>
+        employeeMap.get(r.id) === record.id
+      );
+
+      if (hasReports) {
+        collapsed.add(record.id);
+      }
+
+    }
+
+  });
+
+  setCollapsedNodes(collapsed);
+
+  hasInitializedCollapse.current = true;
+
+}, [records, managerField]);
+
+  // ----------------------------------------------------------
+  // CONFIGURED CARD PROPERTY COLLECTION
+  // ----------------------------------------------------------
+
+  const configuredCardFields = useMemo(() => {
+
+    return [
+      cardProperty1,
+      cardProperty2,
+      cardProperty3,
+      cardProperty4,
+      cardProperty5,
+    ].filter(
+      (field): field is Field =>
+        field !== undefined
+    );
+
+  }, [
+    cardProperty1,
+    cardProperty2,
+    cardProperty3,
+    cardProperty4,
+    cardProperty5,
+  ]);
+
+  // ----------------------------------------------------------
+  // BUILD ORGANIZATION DATA
+  // ----------------------------------------------------------
+
+  const orgData = useMemo(() => {
+
+    if (
+      !table ||
+      !records ||
+      !requiredFieldsConfigured
+    ) {
+      return [];
+    }
+
+    const nodes = new Map<string, OrgNode>();
+
+    // First create all employee nodes.
+    records.forEach(record => {
+
+      const managerValue = managerField
+        ? record.getCellValue(managerField)
         : null;
 
+      const managerId =
+        managerValue &&
+        Array.isArray(managerValue) &&
+        managerValue.length > 0
+          ? managerValue[0].id
+          : null;
+
+      const profilePictureValue =
+        profilePictureField
+          ? record.getCellValue(profilePictureField)
+          : null;
+
+      const profilePicture =
+        profilePictureValue &&
+        Array.isArray(profilePictureValue) &&
+        profilePictureValue.length > 0
+          ? profilePictureValue[0].url
+          : null;
+
       nodes.set(record.id, {
+
         id: record.id,
-        name: nameField ? record.getCellValueAsString(nameField) : '',
+
+        name: nameField
+          ? record.getCellValueAsString(nameField)
+          : '',
+
         profilePicture,
+
         managerId,
+
         children: [],
+
         collapsed: collapsedNodes.has(record.id),
+
         record,
       });
+
     });
 
+    // Then connect employees to their managers.
     nodes.forEach(node => {
-      if (node.managerId && nodes.has(node.managerId)) {
+
+      if (
+        node.managerId &&
+        nodes.has(node.managerId)
+      ) {
+
         const parent = nodes.get(node.managerId);
+
         if (parent) {
           parent.children.push(node);
         }
+
       }
+
     });
 
-    const rootNodes = Array.from(nodes.values()).filter(node => !node.managerId || !nodes.has(node.managerId));
+    // Identify employees without a valid manager.
+    const rootNodes = Array.from(
+      nodes.values()
+    ).filter(
+      node =>
+        !node.managerId ||
+        !nodes.has(node.managerId)
+    );
 
     return rootNodes;
-  }, [table, records, collapsedNodes, nameField, profilePictureField, managerField, requiredFieldsConfigured]);
 
-  // Event handler that extracts node ID from data attribute
-  const handleNodeCardClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    // Prevent opening record detail if this click followed a drag
-    if (hasDraggedRef.current) {
-      hasDraggedRef.current = false;
-      return;
-    }
-    const nodeId = e.currentTarget.dataset.nodeId;
-    if (!nodeId || !table) return;
-    const record = records?.find(r => r.id === nodeId);
-    if (record && canExpandRecords) {
-      expandRecord(record);
-    }
-  }, [table, records, canExpandRecords]);
+  }, [
+    table,
+    records,
+    collapsedNodes,
+    nameField,
+    profilePictureField,
+    managerField,
+    requiredFieldsConfigured,
+  ]);
 
-  // Keyboard handler for node cards (Enter/Space to activate)
-  const handleNodeCardKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      const nodeId = e.currentTarget.dataset.nodeId;
+  // ----------------------------------------------------------
+  // EMPLOYEE CARD CLICK
+  // ----------------------------------------------------------
+
+  const handleNodeCardClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+
+      if (hasDraggedRef.current) {
+        hasDraggedRef.current = false;
+        return;
+      }
+
+      const nodeId =
+        e.currentTarget.dataset.nodeId;
+
       if (!nodeId || !table) return;
-      const record = records?.find(r => r.id === nodeId);
+
+      const record = records?.find(
+        r => r.id === nodeId
+      );
+
       if (record && canExpandRecords) {
         expandRecord(record);
       }
-    }
-  }, [table, records, canExpandRecords]);
+
+    },
+    [
+      table,
+      records,
+      canExpandRecords,
+    ]
+  );
+
+  // ----------------------------------------------------------
+  // KEYBOARD ACCESSIBILITY
+  // ----------------------------------------------------------
+
+  const handleNodeCardKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+
+      if (
+        e.key === 'Enter' ||
+        e.key === ' '
+      ) {
+
+        e.preventDefault();
+
+        const nodeId =
+          e.currentTarget.dataset.nodeId;
+
+        if (!nodeId || !table) return;
+
+        const record = records?.find(
+          r => r.id === nodeId
+        );
+
+        if (record && canExpandRecords) {
+          expandRecord(record);
+        }
+
+      }
+
+    },
+    [
+      table,
+      records,
+      canExpandRecords,
+    ]
+  );
+
+  // ----------------------------------------------------------
+  // ZOOM CONTROLS
+  // ----------------------------------------------------------
 
   const handleZoomIn = useCallback(() => {
-    setZoom(prev => Math.min(prev + 0.1, 2));
+
+    setZoom(previous =>
+      Math.min(previous + 0.1, 2)
+    );
+
   }, []);
 
   const handleZoomOut = useCallback(() => {
-    setZoom(prev => Math.max(prev - 0.1, 0.3));
+
+    setZoom(previous =>
+      Math.max(previous - 0.1, 0.3)
+    );
+
   }, []);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.target === containerRef.current || (e.target as HTMLElement).closest('.org-canvas')) {
+  // ----------------------------------------------------------
+  // MOUSE DRAGGING
+  // ----------------------------------------------------------
+
+  const handleMouseDown = (
+    e: React.MouseEvent
+  ) => {
+
+    if (
+      e.target === containerRef.current ||
+      (e.target as HTMLElement).closest('.org-canvas')
+    ) {
+
       setIsDragging(true);
-      setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
-      mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
+
+      setDragStart({
+        x: e.clientX - pan.x,
+        y: e.clientY - pan.y,
+      });
+
+      mouseDownPosRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+      };
+
       hasDraggedRef.current = false;
     }
+
   };
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (isDragging) {
-      // Check if we've moved more than a small threshold to consider it a real drag
-      const dx = e.clientX - mouseDownPosRef.current.x;
-      const dy = e.clientY - mouseDownPosRef.current.y;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      if (distance > DRAG_THRESHOLD) {
-        hasDraggedRef.current = true;
-      }
-      setPan({
-        x: e.clientX - dragStart.x,
-        y: e.clientY - dragStart.y
-      });
+  const handleMouseMove = (
+    e: React.MouseEvent
+  ) => {
+
+    if (!isDragging) return;
+
+    const dx =
+      e.clientX - mouseDownPosRef.current.x;
+
+    const dy =
+      e.clientY - mouseDownPosRef.current.y;
+
+    const distance = Math.sqrt(
+      dx * dx + dy * dy
+    );
+
+    if (distance > DRAG_THRESHOLD) {
+      hasDraggedRef.current = true;
     }
+
+    setPan({
+      x: e.clientX - dragStart.x,
+      y: e.clientY - dragStart.y,
+    });
+
   };
 
   const handleMouseUp = () => {
     setIsDragging(false);
   };
 
-  const handleWheel = (e: React.WheelEvent) => {
+  // ----------------------------------------------------------
+  // MOUSE WHEEL ZOOM
+  // ----------------------------------------------------------
+
+  const handleWheel = (
+    e: React.WheelEvent
+  ) => {
+
     e.preventDefault();
 
-    // Get cursor position relative to the container
     const container = containerRef.current;
+
     if (!container) return;
 
-    const rect = container.getBoundingClientRect();
-    const cursorX = e.clientX - rect.left;
-    const cursorY = e.clientY - rect.top;
+    const rect =
+      container.getBoundingClientRect();
 
-    // Calculate the point in canvas space that's under the cursor
-    const canvasX = (cursorX - pan.x) / zoom;
-    const canvasY = (cursorY - pan.y) / zoom;
+    const cursorX =
+      e.clientX - rect.left;
 
-    // Calculate new zoom level
+    const cursorY =
+      e.clientY - rect.top;
+
+    const canvasX =
+      (cursorX - pan.x) / zoom;
+
+    const canvasY =
+      (cursorY - pan.y) / zoom;
+
     const zoomIntensity = 0.001;
-    const delta = -e.deltaY * zoomIntensity;
-    const newZoom = Math.max(0.3, Math.min(2, zoom * (1 + delta)));
 
-    // Calculate new pan to keep the cursor point stationary
-    const newPanX = cursorX - canvasX * newZoom;
-    const newPanY = cursorY - canvasY * newZoom;
+    const delta =
+      -e.deltaY * zoomIntensity;
+
+    const newZoom = Math.max(
+      0.3,
+      Math.min(2, zoom * (1 + delta))
+    );
 
     setZoom(newZoom);
-    setPan({ x: newPanX, y: newPanY });
+
+    setPan({
+      x: cursorX - canvasX * newZoom,
+      y: cursorY - canvasY * newZoom,
+    });
+
   };
 
-  // Get card property fields that have values for this record
-  const getFieldsWithValues = useCallback((record: AirtableRecord): Field[] => {
-    return configuredCardFields.filter((field: Field) => {
-      const value = record.getCellValue(field);
-      // Check for null/undefined
-      if (value === null || value === undefined) return false;
-      // Check for empty strings or whitespace-only strings
-      if (typeof value === 'string' && value.trim() === '') return false;
-      // Check for empty arrays (multi-select, attachments, linked records, etc.)
-      if (Array.isArray(value) && value.length === 0) return false;
-      return true;
-    });
-  }, [configuredCardFields]);
+  // ----------------------------------------------------------
+  // GET CONFIGURED FIELDS WITH VALUES
+  // ----------------------------------------------------------
 
-  // Get field count for a node (used for height calculation)
-  const getFieldCount = useCallback((node: OrgNode): number => {
-    return getFieldsWithValues(node.record).length;
-  }, [getFieldsWithValues]);
+  const getFieldsWithValues = useCallback(
+    (record: AirtableRecord): Field[] => {
 
-  // Calculate positions using tree layout algorithm
-  const layoutResult = useMemo(() => calculateTreeLayout(orgData, getFieldCount), [orgData, getFieldCount]);
-  const { positions, nodeHeights, levelHeights, levelYPositions } = layoutResult;
+      return configuredCardFields.filter(
+        (field: Field) => {
 
-  // Calculate canvas bounds
+          const value =
+            record.getCellValue(field);
+
+          if (
+            value === null ||
+            value === undefined
+          ) {
+            return false;
+          }
+
+          if (
+            typeof value === 'string' &&
+            value.trim() === ''
+          ) {
+            return false;
+          }
+
+          if (
+            Array.isArray(value) &&
+            value.length === 0
+          ) {
+            return false;
+          }
+
+          return true;
+
+        }
+      );
+
+    },
+    [configuredCardFields]
+  );
+
+  // ----------------------------------------------------------
+  // GET FIELD COUNT FOR LAYOUT
+  // ----------------------------------------------------------
+
+  const getFieldCount = useCallback(
+    (node: OrgNode): number => {
+
+      return getFieldsWithValues(
+        node.record
+      ).length;
+
+    },
+    [getFieldsWithValues]
+  );
+// ----------------------------------------------------------
+  // CALCULATE TREE LAYOUT
+  // ----------------------------------------------------------
+
+  const layoutResult = useMemo(
+    () =>
+      calculateTreeLayout(
+        orgData,
+        getFieldCount,
+        measuredCardHeights
+      ),
+    [
+      orgData,
+      getFieldCount,
+      measuredCardHeights,
+    ]
+  );
+
+  const {
+    positions,
+    nodeHeights,
+    levelHeights,
+    levelYPositions,
+  } = layoutResult;
+
+  // ----------------------------------------------------------
+  // CALCULATE CANVAS BOUNDS
+  // ----------------------------------------------------------
+
   const canvasBounds = useMemo(() => {
+
     if (positions.size === 0) {
-      return { width: 800, height: 600, offsetX: 50, offsetY: 50 };
-    }
-    let minX = Infinity, maxX = -Infinity;
-    // Calculate max Y based on level positions and heights
-    const lastLevelIndex = levelYPositions.length - 1;
-    const maxY = (levelYPositions[lastLevelIndex] || 0) + (levelHeights[lastLevelIndex] || CARD_BASE_HEIGHT);
-    
-    positions.forEach(pos => {
-      minX = Math.min(minX, pos.x - NODE_WIDTH / 2);
-      maxX = Math.max(maxX, pos.x + NODE_WIDTH / 2);
-    });
-    return {
-      width: Math.max(800, maxX - minX + 100),
-      height: Math.max(600, maxY + 100),
-      offsetX: -minX + 50,
-      offsetY: 50
-    };
-  }, [positions, levelYPositions, levelHeights]);
-
-  const handleToggleCollapse = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
-    e.stopPropagation();
-    const nodeId = e.currentTarget.dataset.nodeId;
-    if (!nodeId) return;
-
-    // Capture the node's current screen position before the layout changes
-    const oldPos = positions.get(nodeId);
-    if (oldPos) {
-      // Calculate current screen position: (canvasPos + offset) * zoom + pan
-      const canvasX = oldPos.x + canvasBounds.offsetX;
-      const canvasY = oldPos.y + canvasBounds.offsetY;
-      anchorNode.current = {
-        nodeId,
-        screenX: canvasX * zoom + pan.x,
-        screenY: canvasY * zoom + pan.y,
+      return {
+        width: 800,
+        height: 600,
+        offsetX: 50,
+        offsetY: 50,
       };
     }
-    setCollapsedNodes(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(nodeId)) {
-        newSet.delete(nodeId);
-      } else {
-        newSet.add(nodeId);
-      }
-      return newSet;
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+
+    const lastLevelIndex =
+      levelYPositions.length - 1;
+
+    const maxY =
+      (levelYPositions[lastLevelIndex] || 0) +
+      (levelHeights[lastLevelIndex] ||
+        CARD_BASE_HEIGHT);
+
+    positions.forEach(pos => {
+
+      minX = Math.min(
+        minX,
+        pos.x - NODE_WIDTH / 2
+      );
+
+      maxX = Math.max(
+        maxX,
+        pos.x + NODE_WIDTH / 2
+      );
+
     });
-  }, [positions, canvasBounds, zoom, pan]);
+
+    return {
+      width: Math.max(
+        800,
+        maxX - minX + 100
+      ),
+
+      height: Math.max(
+        600,
+        maxY + 100
+      ),
+
+      offsetX: -minX + 50,
+
+      offsetY: 50,
+    };
+
+  }, [
+    positions,
+    levelYPositions,
+    levelHeights,
+  ]);
+
+  // ----------------------------------------------------------
+  // COLLAPSE / EXPAND EMPLOYEE REPORTS
+  // ----------------------------------------------------------
+
+  const handleToggleCollapse = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement>) => {
+
+      e.stopPropagation();
+
+      const nodeId =
+        e.currentTarget.dataset.nodeId;
+
+      if (!nodeId) return;
+
+      // Save the current screen position of the
+      // employee so it stays stationary after layout changes.
+      const oldPos = positions.get(nodeId);
+
+      if (oldPos) {
+
+        const canvasX =
+          oldPos.x + canvasBounds.offsetX;
+
+        const canvasY =
+          oldPos.y + canvasBounds.offsetY;
+
+        anchorNode.current = {
+          nodeId,
+
+          screenX:
+            canvasX * zoom + pan.x,
+
+          screenY:
+            canvasY * zoom + pan.y,
+        };
+
+      }
+
+      setCollapsedNodes(previous => {
+
+        const updated = new Set(previous);
+
+        if (updated.has(nodeId)) {
+          updated.delete(nodeId);
+        } else {
+          updated.add(nodeId);
+        }
+
+        return updated;
+
+      });
+
+    },
+    [
+      positions,
+      canvasBounds,
+      zoom,
+      pan,
+    ]
+  );
+
+  // ----------------------------------------------------------
+  // RESET VIEW
+  // ----------------------------------------------------------
 
   const handleResetView = useCallback(() => {
+
     setZoom(1);
-    
-    // Reset to centered view on root node
-    if (orgData.length > 0 && containerRef.current) {
+
+    if (
+      orgData.length > 0 &&
+      containerRef.current
+    ) {
+
       const rootNode = orgData[0];
-      const rootPos = positions.get(rootNode.id);
+
+      const rootPos =
+        positions.get(rootNode.id);
+
       if (rootPos) {
-        const containerRect = containerRef.current.getBoundingClientRect();
-        const viewportWidth = containerRect.width;
-        
-        const rootCanvasX = rootPos.x + canvasBounds.offsetX;
-        const rootCanvasY = rootPos.y + canvasBounds.offsetY;
-        
-        const initialPanX = (viewportWidth / 2) - rootCanvasX;
-        const initialPanY = INITIAL_TOP_PADDING - rootCanvasY;
-        
-        setPan({ x: initialPanX, y: initialPanY });
+
+        const containerRect =
+          containerRef.current.getBoundingClientRect();
+
+        const rootCanvasX =
+          rootPos.x + canvasBounds.offsetX;
+
+        const rootCanvasY =
+          rootPos.y + canvasBounds.offsetY;
+
+        const initialPanX =
+          containerRect.width / 2 - rootCanvasX;
+
+        const initialPanY =
+          INITIAL_TOP_PADDING - rootCanvasY;
+
+        setPan({
+          x: initialPanX,
+          y: initialPanY,
+        });
+
         return;
       }
-    }
-    setPan({ x: 0, y: 0 });
-  }, [orgData, positions, canvasBounds]);
 
-  // Collect all connector lines - connecting from bottom of parent cards to top of child cards
+    }
+
+    setPan({
+      x: 0,
+      y: 0,
+    });
+
+  }, [
+    orgData,
+    positions,
+    canvasBounds,
+  ]);
+
+  // ----------------------------------------------------------
+  // CONNECTOR LINES
+  // ----------------------------------------------------------
+
   const connectorLines = useMemo(() => {
-    const lines: Array<{x1: number, y1: number, x2: number, y2: number, key: string}> = [];
-    
+
+    const lines: Array<{
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+      key: string;
+    }> = [];
+
     function collectLines(node: OrgNode) {
-      const parentPos = positions.get(node.id);
-      if (!parentPos || node.collapsed) return;
-      
-      if (node.children.length === 0) return;
-      
-      // Get all visible children positions
+
+      const parentPos =
+        positions.get(node.id);
+
+      if (!parentPos || node.collapsed) {
+        return;
+      }
+
+      if (node.children.length === 0) {
+        return;
+      }
+
+      // Get visible child positions.
       const childPositions = node.children
         .map(child => positions.get(child.id))
-        .filter((pos): pos is NodePosition => pos !== undefined);
-      
-      if (childPositions.length === 0) return;
-      
-      // Get the parent card's actual height (without the buffer which is just for spacing)
-      const parentHeight = (nodeHeights.get(node.id) || CARD_BASE_HEIGHT) - HEIGHT_BUFFER;
-      
-      // Parent card bottom position
-      const parentBottom = parentPos.y + parentHeight;
-      
-      // Child cards top position
-      const childY = childPositions[0].y;
-      
-      // Horizontal connector line is placed midway between parent bottom and child top
-      const connectorY = parentBottom + (childY - parentBottom) / 2;
-      
-      // Draw vertical line from parent bottom down to connector level
+        .filter(
+          (pos): pos is NodePosition =>
+            pos !== undefined
+        );
+
+      if (childPositions.length === 0) {
+        return;
+      }
+
+      // Use measured parent card height.
+      const parentHeight =
+        measuredCardHeights.get(node.id) ??
+        (
+          (nodeHeights.get(node.id) ||
+            CARD_BASE_HEIGHT) -
+          HEIGHT_BUFFER
+        );
+
+      const parentBottom =
+        parentPos.y + parentHeight;
+
+      const childY =
+        childPositions[0].y;
+
+      const connectorY =
+        parentBottom +
+        (childY - parentBottom) / 2;
+
+      // Vertical line from parent.
       lines.push({
         x1: parentPos.x,
         y1: parentBottom,
         x2: parentPos.x,
         y2: connectorY,
-        key: `v1-${node.id}`
+        key: `v1-${node.id}`,
       });
-      
-      // Draw horizontal line spanning all children AND the parent's x position
-      const childXs = childPositions.map(p => p.x);
-      const leftmostX = Math.min(...childXs, parentPos.x);
-      const rightmostX = Math.max(...childXs, parentPos.x);
-      
+
+      // Horizontal line across children.
+      const childXs =
+        childPositions.map(p => p.x);
+
+      const leftmostX =
+        Math.min(...childXs, parentPos.x);
+
+      const rightmostX =
+        Math.max(...childXs, parentPos.x);
+
       if (leftmostX !== rightmostX) {
+
         lines.push({
           x1: leftmostX,
           y1: connectorY,
           x2: rightmostX,
           y2: connectorY,
-          key: `h-${node.id}`
+          key: `h-${node.id}`,
         });
+
       }
-      
-      // Draw vertical lines from connector down to each child
+
+      // Vertical lines down to each child.
       node.children.forEach(child => {
-        const childPos = positions.get(child.id);
+
+        const childPos =
+          positions.get(child.id);
+
         if (childPos) {
+
           lines.push({
             x1: childPos.x,
             y1: connectorY,
             x2: childPos.x,
             y2: childPos.y,
-            key: `v2-${node.id}-${child.id}`
+            key: `v2-${node.id}-${child.id}`,
           });
+
         }
-        
+
         collectLines(child);
+
       });
+
     }
-    
-    orgData.forEach(root => collectLines(root));
-    return lines;
-  }, [orgData, positions, nodeHeights]);
 
-  const allNodes = useMemo(() => collectAllNodes(orgData), [orgData]);
-
-  // Cache fields with values per node to avoid recalculating during render
-  const nodeFieldsMap = useMemo(() => {
-    const map = new Map<string, Field[]>();
-    allNodes.forEach(node => {
-      map.set(node.id, getFieldsWithValues(node.record));
+    orgData.forEach(root => {
+      collectLines(root);
     });
-    return map;
-  }, [allNodes, getFieldsWithValues]);
 
-  // After DOM commit but before paint, directly set transform to prevent visual jump
-  // useLayoutEffect runs synchronously after React's DOM mutations but before browser paint
+    return lines;
+
+  }, [
+    orgData,
+    positions,
+    nodeHeights,
+    measuredCardHeights,
+  ]);
+
+  // ----------------------------------------------------------
+  // COLLECT ALL VISIBLE NODES
+  // ----------------------------------------------------------
+
+  const allNodes = useMemo(
+    () => collectAllNodes(orgData),
+    [orgData]
+  );
+
+  // ----------------------------------------------------------
+  // CACHE CARD FIELDS
+  // ----------------------------------------------------------
+
+  const nodeFieldsMap = useMemo(() => {
+
+    const map = new Map<string, Field[]>();
+
+    allNodes.forEach(node => {
+
+      map.set(
+        node.id,
+        getFieldsWithValues(node.record)
+      );
+
+    });
+
+    return map;
+
+  }, [
+    allNodes,
+    getFieldsWithValues,
+  ]);
+
+  // ----------------------------------------------------------
+  // KEEP ANCHOR STATIONARY AFTER COLLAPSING
+  // ----------------------------------------------------------
+
   useLayoutEffect(() => {
-    if (!anchorNode.current || !canvasRef.current) return;
-    
-    const { nodeId, screenX, screenY } = anchorNode.current;
-    const newPos = positions.get(nodeId);
-    
+
+    if (
+      !anchorNode.current ||
+      !canvasRef.current
+    ) {
+      return;
+    }
+
+    const {
+      nodeId,
+      screenX,
+      screenY,
+    } = anchorNode.current;
+
+    const newPos =
+      positions.get(nodeId);
+
     if (newPos) {
-      const newCanvasX = newPos.x + canvasBounds.offsetX;
-      const newCanvasY = newPos.y + canvasBounds.offsetY;
+
+      const newCanvasX =
+        newPos.x + canvasBounds.offsetX;
+
+      const newCanvasY =
+        newPos.y + canvasBounds.offsetY;
+
       const newPan = {
+
         x: screenX - newCanvasX * zoom,
+
         y: screenY - newCanvasY * zoom,
+
       };
-      
-      // Directly set the transform on the DOM element - this bypasses React
+
       canvasRef.current.style.transition = 'none';
-      canvasRef.current.style.transform = `translate(${newPan.x}px, ${newPan.y}px) scale(${zoom})`;
-      
-      // Clear anchor and update React state
+
+      canvasRef.current.style.transform =
+        `translate(${newPan.x}px, ${newPan.y}px) scale(${zoom})`;
+
       anchorNode.current = null;
-      
-      // Use a microtask to update state after the current execution
-      // This prevents React from batching it with other updates
+
       queueMicrotask(() => {
         setPan(newPan);
       });
-    } else {
-      anchorNode.current = null;
-    }
-  }, [positions, canvasBounds, zoom]);
 
-  // Calculate initial centered view on the root node
+    } else {
+
+      anchorNode.current = null;
+
+    }
+
+  }, [
+    positions,
+    canvasBounds,
+    zoom,
+  ]);
+
+  // ----------------------------------------------------------
+  // INITIAL VIEW CENTERING
+  // ----------------------------------------------------------
+
   useEffect(() => {
-    if (hasInitializedView.current) return;
-    if (orgData.length === 0) return;
-    if (!containerRef.current) return;
-    
-    // Get the first root node's position
+
+    if (hasInitializedView.current) {
+      return;
+    }
+
+    if (orgData.length === 0) {
+      return;
+    }
+
+    if (!containerRef.current) {
+      return;
+    }
+
     const rootNode = orgData[0];
-    const rootPos = positions.get(rootNode.id);
-    if (!rootPos) return;
-    
-    // Get viewport dimensions
-    const containerRect = containerRef.current.getBoundingClientRect();
-    const viewportWidth = containerRect.width;
-    
-    // Calculate the root node's position in canvas coordinates
-    const rootCanvasX = rootPos.x + canvasBounds.offsetX;
-    const rootCanvasY = rootPos.y + canvasBounds.offsetY;
-    
-    // Calculate pan to center the root node horizontally
-    // and position it near the top with some padding
-    const initialPanX = (viewportWidth / 2) - rootCanvasX;
-    const initialPanY = INITIAL_TOP_PADDING - rootCanvasY;
-    
-    setPan({ x: initialPanX, y: initialPanY });
+
+    const rootPos =
+      positions.get(rootNode.id);
+
+    if (!rootPos) {
+      return;
+    }
+
+    const containerRect =
+      containerRef.current.getBoundingClientRect();
+
+    const viewportWidth =
+      containerRect.width;
+
+    const rootCanvasX =
+      rootPos.x + canvasBounds.offsetX;
+
+    const rootCanvasY =
+      rootPos.y + canvasBounds.offsetY;
+
+    const initialPanX =
+      viewportWidth / 2 - rootCanvasX;
+
+    const initialPanY =
+      INITIAL_TOP_PADDING - rootCanvasY;
+
+    setPan({
+      x: initialPanX,
+      y: initialPanY,
+    });
+
     hasInitializedView.current = true;
-  }, [orgData, positions, canvasBounds]);
+
+  }, [
+    orgData,
+    positions,
+    canvasBounds,
+  ]);
+
+  // ----------------------------------------------------------
+  // CONFIGURATION VALIDATION
+  // ----------------------------------------------------------
 
   if (!table) {
+
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-800">
+
         <div className="text-center">
-          <p className="text-gray-600 dark:text-gray-400">Table not found</p>
+
+          <p className="text-gray-600 dark:text-gray-400">
+            Table not found
+          </p>
+
         </div>
+
       </div>
     );
+
   }
 
   if (errorState) {
+
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-800">
+
         <div className="text-center">
-          <p className="text-gray-600 dark:text-gray-400">Error loading custom properties</p>
+
+          <p className="text-gray-600 dark:text-gray-400">
+            Error loading custom properties
+          </p>
+
         </div>
+
       </div>
     );
+
   }
 
   if (!requiredFieldsConfigured) {
+
     const missingFields: string[] = [];
-    if (!nameField) missingFields.push('Name');
-    if (!profilePictureField) missingFields.push('Profile Picture');
-    if (!managerField) missingFields.push('Manager');
+
+    if (!nameField) {
+      missingFields.push('Name');
+    }
+
+    if (!profilePictureField) {
+      missingFields.push('Profile Picture');
+    }
+
+    if (!managerField) {
+      missingFields.push('Manager');
+    }
 
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-800">
+
         <div className="text-center max-w-md mx-auto p-6">
+
           <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">
             Configuration Required
           </h2>
+
           <p className="text-gray-600 dark:text-gray-400 mb-4">
             Please configure the required fields in the properties panel to display the org chart.
           </p>
-          <p className="text-sm text-gray-500 dark:text-gray-500">
+
+          <p className="text-sm text-gray-500 dark:text-gray-400">
             Missing fields: {missingFields.join(', ')}.
           </p>
+
         </div>
+
       </div>
     );
+
   }
 
+  // ----------------------------------------------------------
+  // MAIN RENDER
+  // ----------------------------------------------------------
+
   return (
+
     <div className="min-h-screen bg-gray-50 dark:bg-gray-800 relative overflow-hidden">
-      <div className="absolute top-4 right-4 z-10 flex gap-2" role="toolbar" aria-label="Zoom controls">
+
+      {/* ZOOM TOOLBAR */}
+
+      <div
+        className="absolute top-4 right-4 z-10 flex gap-2"
+        role="toolbar"
+        aria-label="Zoom controls"
+      >
+
         <button
           onClick={handleZoomIn}
           aria-label="Zoom in"
           className="bg-white dark:bg-gray-600 hover:bg-black/5 dark:hover:bg-white/5 dark:text-white px-3 py-1.5 rounded-md shadow-xs hover:shadow-sm hover:cursor-pointer flex items-center gap-1.5"
         >
-          <PlusIcon size={16} aria-hidden="true" />
+          <PlusIcon
+            size={16}
+            aria-hidden="true"
+          />
         </button>
+
         <button
           onClick={handleZoomOut}
           aria-label="Zoom out"
           className="bg-white dark:bg-gray-600 hover:bg-black/5 dark:hover:bg-white/5 dark:text-white px-3 py-1.5 rounded-md shadow-xs hover:shadow-sm hover:cursor-pointer flex items-center gap-1.5"
         >
-          <MinusIcon size={16} aria-hidden="true" />
+          <MinusIcon
+            size={16}
+            aria-hidden="true"
+          />
         </button>
+
         <button
           onClick={handleResetView}
           aria-label="Reset view to default zoom and position"
@@ -834,7 +1834,10 @@ function OrgChartApp(): React.ReactElement {
         >
           Reset View
         </button>
+
       </div>
+
+      {/* ORG CHART VIEWPORT */}
 
       <div
         ref={containerRef}
@@ -845,67 +1848,146 @@ function OrgChartApp(): React.ReactElement {
         onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
       >
+
+        {/* TRANSFORMABLE CANVAS */}
+
         <div
           ref={canvasRef}
           style={{
-            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transform:
+              `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+
             transformOrigin: '0 0',
-            transition: isDragging ? 'none' : 'transform 0.1s ease-out',
+
+            transition: isDragging
+              ? 'none'
+              : 'transform 0.1s ease-out',
+
             width: canvasBounds.width,
+
             height: canvasBounds.height,
           }}
           className="relative"
         >
+
+          {/* EMPTY STATE */}
+
           {orgData.length === 0 ? (
+
             <div className="text-center mt-20">
+
               <p className="text-gray-600 dark:text-gray-400 text-lg">
                 No employees found in the directory
               </p>
+
             </div>
+
           ) : (
+
             <>
-              {/* SVG layer for connector lines */}
+
+              {/* CONNECTOR SVG LAYER */}
+
               <svg
                 className="absolute inset-0 pointer-events-none"
-                style={{ width: canvasBounds.width, height: canvasBounds.height }}
+                style={{
+                  width: canvasBounds.width,
+                  height: canvasBounds.height,
+                }}
               >
+
                 {connectorLines.map(line => (
+
                   <line
                     key={line.key}
-                    x1={line.x1 + canvasBounds.offsetX}
-                    y1={line.y1 + canvasBounds.offsetY}
-                    x2={line.x2 + canvasBounds.offsetX}
-                    y2={line.y2 + canvasBounds.offsetY}
+
+                    x1={
+                      line.x1 +
+                      canvasBounds.offsetX
+                    }
+
+                    y1={
+                      line.y1 +
+                      canvasBounds.offsetY
+                    }
+
+                    x2={
+                      line.x2 +
+                      canvasBounds.offsetX
+                    }
+
+                    y2={
+                      line.y2 +
+                      canvasBounds.offsetY
+                    }
+
                     className="stroke-gray-300 dark:stroke-gray-600"
+
                     strokeWidth={2}
                   />
+
                 ))}
+
               </svg>
-              
-              {/* Node cards */}
+
+              {/* EMPLOYEE NODE CARDS */}
+
               {allNodes.map(node => {
-                const pos = positions.get(node.id);
-                if (!pos) return null;
+
+                const pos =
+                  positions.get(node.id);
+
+                if (!pos) {
+                  return null;
+                }
+
                 return (
+
                   <NodeCard
                     key={node.id}
+
                     node={node}
+
                     position={pos}
+
                     canvasBounds={canvasBounds}
+
                     canExpandRecords={canExpandRecords}
-                    fieldsWithValues={nodeFieldsMap.get(node.id) || []}
+
+                    fieldsWithValues={
+                      nodeFieldsMap.get(node.id) || []
+                    }
+
                     onCardClick={handleNodeCardClick}
+
                     onCardKeyDown={handleNodeCardKeyDown}
+
                     onToggleCollapse={handleToggleCollapse}
+
+                    onCardHeightChange={handleCardHeightChange}
                   />
+
                 );
+
               })}
+
             </>
+
           )}
+
         </div>
+
       </div>
+
     </div>
+
   );
 }
 
-initializeBlock({ interface: () => <OrgChartApp /> });
+// ============================================================
+// AIRTABLE BLOCK INITIALIZATION
+// ============================================================
+
+initializeBlock({
+  interface: () => <OrgChartApp />,
+});
